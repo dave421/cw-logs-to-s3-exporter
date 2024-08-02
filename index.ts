@@ -5,6 +5,10 @@ import {
   DeleteLogStreamCommand,
   DescribeLogStreamsCommand,
   DescribeExportTasksCommand,
+  DescribeExportTasksCommandOutput,
+  CreateExportTaskCommandInput,
+  ExportTask,
+  CreateExportTaskCommandOutput,
 } from "@aws-sdk/client-cloudwatch-logs";
 import dayjs from "dayjs";
 
@@ -18,6 +22,8 @@ const limit = 50;
 const client = new CloudWatchLogsClient(config);
 let total: any = [];
 let logGroups: string[] = [];
+let skippedLogGroups: string[] = [];
+let runningTaskIds: string[] = [];
 const numWeeks = 6;
 const now = new Date();
 const sixWeeksAgo = now.setDate(now.getDate() - numWeeks * 7);
@@ -31,9 +37,9 @@ const timeout = async (ms: number) =>
  * @returns
  */
 const getLogGroups = async (nextToken: string | undefined = undefined) => {
+  console.log(`getting ${limit} log groups from token: ${nextToken}`);
   const command = new DescribeLogGroupsCommand({ limit, nextToken });
   const response = await client.send(command);
-  console.log("token:", response.nextToken);
   response.logGroups?.map((logGroup) => {
     if (
       logGroup.logGroupName?.includes("prod-") &&
@@ -54,7 +60,7 @@ const getLogGroups = async (nextToken: string | undefined = undefined) => {
   }
 };
 
-const describeLogGroupStreams = async (logGroupName: string) => {
+const getOldestCreationTimestamp = async (logGroupName: string) => {
   if (!logGroupName) return;
   const params = {
     logGroupName,
@@ -70,9 +76,14 @@ const describeLogGroupStreams = async (logGroupName: string) => {
   const oldestCreationTimestamp =
     response.logStreams[0].firstEventTimestamp ??
     response.logStreams[0].creationTime;
-  console.log({ oldestCreationTimestamp });
-  console.log(dayjs(oldestCreationTimestamp).format("YYYY-MM-DD HH:mm:ss"));
-  console.log({ logGroupName });
+  console.log({
+    logGroupName,
+    oldestCreationTimestamp,
+    "oldestCreationTimestamp (friendly)": dayjs(oldestCreationTimestamp).format(
+      "YYYY-MM-DD HH:mm:ss"
+    ),
+  });
+
   return oldestCreationTimestamp;
 };
 
@@ -80,17 +91,25 @@ const describeLogGroupStreams = async (logGroupName: string) => {
  * Initialise a log group stream export to S3
  * @param logGroupName
  */
-const exportLogGroupStream = async (logGroupName: string) => {
+const exportLogGroupStream = async (
+  logGroupName: string
+): Promise<CreateExportTaskCommandOutput | undefined> => {
   if (!logGroupName) return;
   console.log(
     "sending create export task command for log group name: ",
     logGroupName
   );
-  const timestampFrom = await describeLogGroupStreams(logGroupName);
+  const timestampFrom = await getOldestCreationTimestamp(logGroupName);
+  // ^^^ we need to wait for this to complete before we can proceed, ie STATUS: COMPLETED, send describeExportTasks(taskID) command
+  // and if status is not COMPLETED, then we need to wait for it to complete before we can proceed
+  if (!timestampFrom) {
+    console.log(`skipping log group: ${logGroupName} as no timestamp found`);
+    skippedLogGroups.push(logGroupName);
+    return;
+  }
   const logGroupNameArr = logGroupName.split("/"); //'/aws/lambda/staging-EmailsGetEmailTemplates-v2'
   const groupName = logGroupNameArr[logGroupNameArr.length - 1];
-  const taskName = `${dayjs().format("YYYY-MM-DD HH:mm:ss")}--${groupName}`;
-  const params = {
+  const params: CreateExportTaskCommandInput = {
     destination: "clearabee-cloudwatch-logs",
     //from: sixWeeksAgo,
     // from: now.setDate(now.getDate() - numWeeks * 120),
@@ -98,47 +117,56 @@ const exportLogGroupStream = async (logGroupName: string) => {
     logGroupName,
     to: new Date().getTime(),
     //to: sixWeeksAgo,
-    taskName,
     destinationPrefix: `exportedLogs/${groupName}/${dayjs().format(
       "YYYY-MM-DD"
     )}`,
   };
+  params["taskName"] = `${dayjs().format(
+    "YYYY-MM-DD HH:mm:ss"
+  )}--${groupName} | export from: ${dayjs(params.from).format(
+    "YYYY-MM-DD HH:mm:ss"
+  )} - to: ${dayjs(params.to).format("YYYY-MM-DD HH:mm:ss")}`;
+
   const command = new CreateExportTaskCommand(params);
-  if (logGroupName) return (await client.send(command)) ?? false;
+  const result: CreateExportTaskCommandOutput = await client.send(command);
+  console.log({ result });
+
+  // await new Promise(async (resolve, reject) => {
+  //   console.log("setting timeout 10 seconds");
+  //   await timeout(10000).then(async () => {
+  //     resolve(await describeExportTasks(result.taskId));
+  //   });
+  // });
+
+  // await timeout(250).then(async () => {
+  //   const response = await describeExportTasks(result.taskId);
+  //   while (response.exportTasks?.[0].status?.code === "RUNNING") {
+  //     console.log("waiting 5 seconds...");
+  //     await timeout(5000).then(async () => {
+  //       console.log("rerunning describeExportTasks() after waiting 5 seconds"),
+  //         (response = await describeExportTasks(result.taskId));
+  //     });
+
+  //   }
+  // }
 };
 
 /**
- * Check for any running export tasks first, if none running then proceed to create a new export task
- * with the supplied logGroupName
+ * Check the status of an export task, if completed then return the task else keep checking
  * @param logGroupName
  * @returns
  */
-const describeExportTasks = async (logGroupName?: string) => {
-  const command = new DescribeExportTasksCommand({});
-  const response = await client.send(command);
-  console.log({ describeExportTasks: response });
-
-  let reRun = false;
-  console.log({ reRun });
-
-  response.exportTasks?.map(async (task) => {
-    if (task.status?.code == "RUNNING" || task.status?.code == "PENDING") {
-      console.log({ runningTask: task });
-      reRun = true;
-    }
+const describeExportTasks = async (taskId?: string) => {
+  console.log(`checking export task status for taskId: ${taskId}`);
+  if (!taskId) return;
+  const command = new DescribeExportTasksCommand({
+    taskId,
   });
-  console.log({ reRun });
-
-  if (reRun)
-    return new Promise(async (resolve, reject) => {
-      console.log("setting timeout 10 seconds");
-      await timeout(10000).then(async () => {
-        console.log("rerunning describeExportTasks() after waiting 10 seconds"),
-          resolve(await describeExportTasks());
-      });
-    });
-
-  return await exportLogGroupStream(logGroupName as string);
+  const response = await client.send(command);
+  console.log({ response, exportTasks: response.exportTasks });
+  const exportTask = response.exportTasks?.[0];
+  console.log({ exportTask, status: { ...exportTask?.status } });
+  console.log(`exportTask status: ${exportTask?.status?.code}`);
 };
 
 /**
@@ -187,19 +215,20 @@ const deleteLogGroupStreams = async (
  */
 const deleteLogStream = async (logGroupName: string, logStreamName: string) => {
   console.log(
-    `deleting logs for stream ${logStreamName} in log group ${logGroupName}`
+    `(TEST!) deleting logs for stream ${logStreamName} in log group ${logGroupName}`
   );
-  const command = new DeleteLogStreamCommand({
-    logGroupName,
-    logStreamName,
-  });
-  try {
-    const deleteResult = await client.send(command);
-    console.log({ deleteResult });
-    return deleteResult;
-  } catch (error) {
-    console.log({ error });
-  }
+  return true;
+  // const command = new DeleteLogStreamCommand({
+  //   logGroupName,
+  //   logStreamName,
+  // });
+  // try {
+  //   const deleteResult = await client.send(command);
+  //   console.log({ deleteResult });
+  //   return deleteResult;
+  // } catch (error) {
+  //   console.log({ error });
+  // }
 };
 
 const deleteStreams = async () => {
@@ -221,12 +250,54 @@ const exportStreams = async () => {
   // console.log(`logGroups length: ${logGroups.length}`);
   // let i = logGroups.length;
 
-  for (let i = 0; i <= logGroups.length; i++) {
-    await timeout(1000).then(async () => {
-      console.log("describing export tasks");
-      await describeExportTasks(logGroups[i]);
-    });
+  await exportLogGroupStream(`/aws/lambda/prod-adminAuthenticate`);
+  // for (let i = 0; i <= logGroups.length; i++)
+  //   await timeout(500).then(
+  //     async () => await exportLogGroupStream(logGroups[i])
+  //   );
+};
+
+const checkExportTaskStatus = async (
+  taskId: string,
+  maxRetries = 10,
+  retryDelay = 5000
+) => {
+  let retries = 0;
+
+  while (retries < maxRetries) {
+    try {
+      const command = new DescribeExportTasksCommand({
+        taskId,
+      });
+
+      const response = await client.send(command);
+      console.log({ response });
+
+      const exportTask = response.exportTasks?.[0];
+      if (exportTask) {
+        const status = <string>exportTask.status;
+        console.log(`Task status: ${status}`);
+
+        if (status === "COMPLETED") {
+          console.log("Export task completed successfully");
+          return;
+        } else if (status === "FAILED" || status === "CANCELLED") {
+          console.error(`Export task failed or cancelled: ${status}, rerun?`);
+          return;
+        }
+      } else {
+        console.error("Export task not found");
+        return;
+      }
+    } catch (error) {
+      console.error("Error checking export task status:", error);
+    }
+
+    retries++;
+    await new Promise((resolve) => setTimeout(resolve, retryDelay));
   }
+
+  console.error("Maximum retries reached without task completion");
 };
 
 const start = new Date().getSeconds();
@@ -238,13 +309,32 @@ const start = new Date().getSeconds();
   //     console.log(`total records fetched: ${total.length}`);
   //   });
   // });
-  await getLogGroups().then(async (d) => {
-    await exportStreams().then(() => {
-      const end = new Date().getSeconds();
-      console.log(`completed in: ${end - start} seconds`);
-      console.log(`total records fetched: ${total.length}`);
-    });
-  });
+  // await getLogGroups().then(async (d) => {
+  //   console.log(`Done, logGroups length: ${logGroups.length}`);
+  //   // await exportStreams().then(() => {
+  //   //   const end = new Date().getSeconds();
+  //   //   console.log(`completed in: ${end - start} seconds`);
+  //   //   console.log(`total records fetched: ${total.length}`);
+  //   // });
+  // });
+
+  // await getLogGroups();
+  // console.log(
+  //   `getLogGroups() done, total log groups for export: ${logGroups.length}`
+  // );
+  console.log("exporting streams...");
+  await exportStreams();
+  console.log("exportStreams() done");
+  console.log(`Running tasks: ${runningTaskIds.length}`);
+  // check the status of the running tasks
+  for (const taskId of runningTaskIds) {
+    // await checkExportTaskStatus(taskId);
+    await describeExportTasks(taskId);
+  }
+  // console.log(`Skipped log groups: ${skippedLogGroups.length}`);
+
+  // TODO check running task id's statuses.  Tasks expire after 24 hours. We may have to cancel a running task perhaps?
+
   //await exportStreams();
   //await describeExportTasks();
 })();
